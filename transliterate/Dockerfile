@@ -11,12 +11,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# CPU-only torch first: ai4bharat-transliteration depends on torch without
-# pinning a build, and pip's default resolution pulls the full CUDA wheel
-# (several GB) for a service that only ever runs on CPU here. Installing the
-# CPU build first means the later `pip install -r requirements.txt` finds
-# torch already satisfied and leaves it alone.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+# Tried pre-installing CPU-only torch/torchaudio here to dodge the several-
+# hundred-MB CUDA wheels pip's resolver otherwise pulls in (nvidia-cudnn,
+# nvidia-cusparselt, triton, ...) for a service that only ever runs on CPU.
+# It didn't hold: a transitive requirement from further down the dependency
+# tree forced pip to upgrade past the pin during `pip install -r
+# requirements.txt` anyway, so it was just wasted build time. The CUDA
+# packages are unused weight (dead code paths, never invoked on CPU) rather
+# than a functional problem, so not worth fighting further for now — see
+# app.py's torch.load patch for the fix that actually matters.
 
 # fairseq's C++ extensions are written against numpy's older C API and fail
 # to build against numpy 2.x, which pip would otherwise resolve to. Pinning
