@@ -1,0 +1,71 @@
+version: '3.8'
+
+# Standalone translation stack — deployed and run independently of
+# talkmos-backend, which reaches it over the host machine at
+# http://host.docker.internal:6010 (see translate/talkmos-backend's own
+# docker-compose.yml and .env for TRANSLATE_SERVICE_URL). Nothing in here
+# knows talkmos-backend exists; it's just a plain translation API.
+
+services:
+  # Orchestrator and the only service published to the host — everything
+  # else is internal-only, reachable from here alone. Owns the whole
+  # pipeline: language detection, deciding when to transliterate, then
+  # calling Argos Translate.
+  translate:
+    build:
+      context: ./translate-service
+    container_name: translator-translate
+    restart: unless-stopped
+    ports:
+      - "6010:8200"
+    depends_on:
+      - libretranslate
+      - transliterate
+
+  # Argos Translate wrapped in a REST API — Argos Translate itself is just a
+  # Python library with no server of its own, so this is the standard way to
+  # run it as a service. No ports published — only `translate` talks to it,
+  # at http://libretranslate:5000.
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    container_name: translator-libretranslate
+    restart: unless-stopped
+    # A freshly created named volume is root-owned by default, but the image
+    # drops to a non-root `libretranslate` user before it ever touches
+    # /home/libretranslate/.local/share — it can't create its own model
+    # directory there and crashes before downloading anything. Running the
+    # container as root sidesteps that; it's not reachable from outside this
+    # compose network anyway.
+    user: "0:0"
+    environment:
+      # Loads only the language pairs the app actually offers (English,
+      # Hindi, Bengali) instead of LibreTranslate's full ~30-language
+      # default set, which would mean a much longer first-boot model
+      # download and a lot of unused RAM.
+      - LT_LOAD_ONLY=en,hi,bn
+      - LT_DISABLE_WEB_UI=true
+      - LT_UPDATE_MODELS=false
+    volumes:
+      # Downloaded Argos Translate models persist here — without this every
+      # container recreate (redeploy, `docker-compose up`) re-downloads them.
+      - libretranslate_models:/home/libretranslate/.local/share
+
+  # Romanized-Hindi ("Hinglish") -> Devanagari, ahead of LibreTranslate.
+  # Argos Translate's Hindi model expects native Devanagari script; fed
+  # "toh kaise hai aap" directly it doesn't reliably understand it as Hindi
+  # at all. `translate` runs a language-detection confidence check first
+  # and only routes text through here when it looks like unrecognized
+  # romanized text, not on every request. No ports published — internal
+  # only, at http://transliterate:8100. No persistent volume: IndicXlit's
+  # model is small (~11M params), so re-downloading it on a rare container
+  # recreate is a minor one-time cost — not worth guessing at an
+  # undocumented cache path for (see the LibreTranslate permission
+  # workaround above, from doing exactly that once already).
+  transliterate:
+    build:
+      context: ./transliterate
+    container_name: translator-transliterate
+    restart: unless-stopped
+
+volumes:
+  libretranslate_models:
