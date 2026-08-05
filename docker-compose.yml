@@ -6,6 +6,22 @@ version: '3.8'
 # docker-compose.yml and .env for TRANSLATE_SERVICE_URL). Nothing in here
 # knows talkmos-backend exists; it's just a plain translation API.
 
+# Shared container hardening/limits, merged into every service below via
+# `<<: *resource-limits`. Same budget (1 CPU, 1GB RAM+swap, 100 PIDs) for
+# all three since none of them are expected to run hot concurrently.
+x-resource-limits: &resource-limits
+  cpus: "1.0"
+  mem_limit: 1g
+  mem_swap_limit: 1g
+  pids_limit: 100
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+
 services:
   # Orchestrator and the only service published to the host — everything
   # else is internal-only, reachable from here alone. Owns the whole
@@ -21,6 +37,7 @@ services:
     depends_on:
       - libretranslate
       - transliterate
+    <<: *resource-limits
 
   # Argos Translate wrapped in a REST API — Argos Translate itself is just a
   # Python library with no server of its own, so this is the standard way to
@@ -49,6 +66,7 @@ services:
       # Downloaded Argos Translate models persist here — without this every
       # container recreate (redeploy, `docker-compose up`) re-downloads them.
       - libretranslate_models:/home/libretranslate/.local/share
+    <<: *resource-limits
 
   # Romanized-Hindi ("Hinglish") -> Devanagari, ahead of LibreTranslate.
   # Argos Translate's Hindi model expects native Devanagari script; fed
@@ -66,6 +84,15 @@ services:
       context: ./transliterate
     container_name: translator-transliterate
     restart: unless-stopped
+    # IndicXlit's model cache path is undocumented (see the comment above on
+    # why it isn't volume-mounted) but almost certainly lands somewhere
+    # under $HOME by default. Pointing HOME at the tmpfs /tmp mount below
+    # means that write lands somewhere writable under read_only without us
+    # having to know the exact path — verify on first deploy that it
+    # actually downloads successfully under read_only before relying on it.
+    environment:
+      - HOME=/tmp
+    <<: *resource-limits
 
 volumes:
   libretranslate_models:
