@@ -1,4 +1,4 @@
-# translator
+# Translator
 
 A standalone translation API. Fully self-hosted, no external API keys or
 per-request cost — English, Hindi, and Bengali, with automatic language
