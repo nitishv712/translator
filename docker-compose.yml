@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Standalone translation stack — deployed and run independently of
 # talkmos-backend, which reaches it over the host machine at
 # http://host.docker.internal:6010 (see translate/talkmos-backend's own
@@ -12,7 +10,7 @@ version: '3.8'
 x-resource-limits: &resource-limits
   cpus: "1.0"
   mem_limit: 1g
-  mem_swap_limit: 1g
+  memswap_limit: 1g
   pids_limit: 100
   cap_drop:
     - ALL
