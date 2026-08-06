@@ -4,21 +4,20 @@
 # docker-compose.yml and .env for TRANSLATE_SERVICE_URL). Nothing in here
 # knows talkmos-backend exists; it's just a plain translation API.
 
-# Shared container hardening/limits, merged into every service below via
-# `<<: *resource-limits`. Same budget (1 CPU, 1GB RAM+swap, 100 PIDs) for
-# all three since none of them are expected to run hot concurrently.
+# Shared resource limits, merged into every service below via
+# `<<: *resource-limits`. Same budget (1 CPU, 1GB RAM+swap) for all three
+# since none of them are expected to run hot concurrently.
+#
+# Deliberately NOT adding cap_drop/read_only/security_opt here: libretranslate
+# runs as root specifically to get write access to its volume (see the
+# comment below), and dropping capabilities strips root's ability to do that
+# even though it's still uid 0 — that's what caused the permission-denied
+# errors. Revisit hardening later with per-service cap_add exceptions if
+# needed, rather than a blanket cap_drop: ALL.
 x-resource-limits: &resource-limits
   cpus: "1.0"
   mem_limit: 1g
   memswap_limit: 1g
-  pids_limit: 100
-  cap_drop:
-    - ALL
-  security_opt:
-    - no-new-privileges:true
-  read_only: true
-  tmpfs:
-    - /tmp:rw,noexec,nosuid,size=64m
 
 services:
   # Orchestrator and the only service published to the host — everything
@@ -82,14 +81,6 @@ services:
       context: ./transliterate
     container_name: translator-transliterate
     restart: unless-stopped
-    # IndicXlit's model cache path is undocumented (see the comment above on
-    # why it isn't volume-mounted) but almost certainly lands somewhere
-    # under $HOME by default. Pointing HOME at the tmpfs /tmp mount below
-    # means that write lands somewhere writable under read_only without us
-    # having to know the exact path — verify on first deploy that it
-    # actually downloads successfully under read_only before relying on it.
-    environment:
-      - HOME=/tmp
     <<: *resource-limits
 
 volumes:
