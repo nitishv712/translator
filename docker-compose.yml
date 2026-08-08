@@ -71,11 +71,8 @@ services:
   # at all. `translate` runs a language-detection confidence check first
   # and only routes text through here when it looks like unrecognized
   # romanized text, not on every request. No ports published — internal
-  # only, at http://transliterate:8100. No persistent volume: IndicXlit's
-  # model is small (~11M params), so re-downloading it on a rare container
-  # recreate is a minor one-time cost — not worth guessing at an
-  # undocumented cache path for (see the LibreTranslate permission
-  # workaround above, from doing exactly that once already).
+  # only, at http://transliterate:8100. Rule-based conversion (see app.py)
+  # — no model weights to fetch or cache, so no volume needed here either.
   transliterate:
     build:
       context: ./transliterate

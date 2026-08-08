@@ -1,3 +1,3 @@
-ai4bharat-transliteration
+indic-transliteration
 flask
 gunicorn
