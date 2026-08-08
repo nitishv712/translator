@@ -15,15 +15,15 @@
 # errors. Revisit hardening later with per-service cap_add exceptions if
 # needed, rather than a blanket cap_drop: ALL.
 x-resource-limits: &resource-limits
-  cpus: "1.0"
-  mem_limit: 1g
-  memswap_limit: 1g
+  cpus: "2.0"
+  mem_limit: 2g
+  memswap_limit: 2g
 
 services:
   # Orchestrator and the only service published to the host — everything
   # else is internal-only, reachable from here alone. Owns the whole
   # pipeline: language detection, deciding when to transliterate, then
-  # calling Argos Translate.
+  # calling NLLB for the actual translation.
   translate:
     build:
       context: ./translate-service
@@ -33,13 +33,16 @@ services:
       - "6010:8200"
     depends_on:
       - libretranslate
+      - nllb-translate
       - transliterate
     <<: *resource-limits
 
-  # Argos Translate wrapped in a REST API — Argos Translate itself is just a
-  # Python library with no server of its own, so this is the standard way to
-  # run it as a service. No ports published — only `translate` talks to it,
-  # at http://libretranslate:5000.
+  # LibreTranslate, kept only for its /detect endpoint now — see
+  # translate-service/app.py for why detection stayed here instead of
+  # moving to a general-purpose library alongside the NLLB swap below.
+  # Argos Translate itself is just a Python library with no server of its
+  # own, so this is the standard way to run it as a service. No ports
+  # published — only `translate` talks to it, at http://libretranslate:5000.
   libretranslate:
     image: libretranslate/libretranslate:latest
     container_name: translator-libretranslate
@@ -55,7 +58,9 @@ services:
       # Loads only the language pairs the app actually offers (English,
       # Hindi, Bengali) instead of LibreTranslate's full ~30-language
       # default set, which would mean a much longer first-boot model
-      # download and a lot of unused RAM.
+      # download and a lot of unused RAM. Also shapes what /detect can
+      # distinguish between — narrowing it to just these three is part of
+      # why its detection is well-behaved for this app's inputs.
       - LT_LOAD_ONLY=en,hi,bn
       - LT_DISABLE_WEB_UI=true
       - LT_UPDATE_MODELS=false
@@ -63,6 +68,24 @@ services:
       # Downloaded Argos Translate models persist here — without this every
       # container recreate (redeploy, `docker-compose up`) re-downloads them.
       - libretranslate_models:/home/libretranslate/.local/share
+    <<: *resource-limits
+
+  # NLLB-200 (distilled 600M) via CTranslate2 — the actual translation
+  # engine, replacing Argos Translate's own (noticeably less fluent)
+  # models. No ports published — only `translate` talks to it, at
+  # http://nllb-translate:8300. See nllb-translate/app.py for the full
+  # rationale.
+  nllb-translate:
+    build:
+      context: ./nllb-translate
+    container_name: translator-nllb-translate
+    restart: unless-stopped
+    # Overrides the shared 1GB budget below: an int8-quantized 600M-param
+    # model plus the CTranslate2/transformers runtime needs more headroom
+    # than that to even start, though it stays well inside the shared CPU
+    # budget once running.
+    mem_limit: 2g
+    memswap_limit: 2g
     <<: *resource-limits
 
   # Romanized-Hindi ("Hinglish") -> Devanagari, ahead of LibreTranslate.

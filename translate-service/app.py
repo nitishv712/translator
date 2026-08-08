@@ -8,9 +8,21 @@ forwards the request here; this owns the real logic:
   3. A low-confidence detection is most often romanized Hindi ("Hinglish")
      misread as English (LibreTranslate has no "Hinglish" label of its own,
      and Hinglish is Latin-script like English) — run it through the
-     transliterate service first so Argos Translate's Hindi model gets the
-     native Devanagari script it was actually trained on.
-  4. Call LibreTranslate (Argos Translate) for the real translation.
+     transliterate service first so the translation model gets the native
+     Devanagari script it was actually trained on.
+  4. Call the NLLB translation service for the real translation.
+
+LibreTranslate itself is only used for step 2 (its /detect endpoint) now —
+translation (step 4) moved to a dedicated NLLB service because Argos
+Translate's own translations were noticeably less fluent for this app's
+pairs (e.g. "How is you" instead of "How are you"). Detection stayed on
+LibreTranslate rather than moving to a general-purpose library like
+langdetect: LibreTranslate's detector is already tuned well for exactly
+this app's ambiguity (short, informal Latin-script text that's either real
+English or romanized Hindi) — testing langdetect on the same kind of input
+("mujhe pyaar hai", "good morning") returned confident-but-wrong guesses
+(Swahili, Croatian), which would have broken the fallback below rather
+than just being a lateral swap.
 
 Kept as its own service — not a module inside the main backend — so the
 translation pipeline can be understood, deployed, and scaled on its own,
@@ -24,12 +36,13 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "http://libretranslate:5000")
+NLLB_URL = os.environ.get("NLLB_URL", "http://nllb-translate:8300")
 TRANSLITERATE_URL = os.environ.get("TRANSLITERATE_URL", "http://transliterate:8100")
 
-# "hinglish" isn't a real language LibreTranslate/Argos Translate has a model
-# for, so an explicit "hinglish" source is aliased to Hindi. In practice
-# callers send "auto" and let detection + the confidence fallback below
-# decide; this only matters for a caller that names it explicitly.
+# "hinglish" isn't a real language the translation model has directly — an
+# explicit "hinglish" source is aliased to Hindi. In practice callers send
+# "auto" and let detection + the confidence fallback below decide; this
+# only matters for a caller that names it explicitly.
 LANGUAGE_ALIASES = {
     "hinglish": "hi",
 }
@@ -92,6 +105,11 @@ def translate():
     try:
         if source and source != "auto":
             source_code = resolve_language_code(source)
+            if source in LANGUAGE_ALIASES:
+                # Explicit "hinglish" hits the same out-of-distribution
+                # problem as the low-confidence auto-detect path below —
+                # Argos's Hindi model needs Devanagari, not romanized text.
+                working_text = transliterate_to_hindi(text)
         else:
             detected = detect_language(text)
             if detected["confidence"] < HINGLISH_FALLBACK_CONFIDENCE:
@@ -107,12 +125,11 @@ def translate():
             return jsonify({"translatedText": working_text})
 
         resp = requests.post(
-            f"{LIBRETRANSLATE_URL}/translate",
+            f"{NLLB_URL}/translate",
             json={
                 "q": working_text,
                 "source": source_code,
                 "target": target_code,
-                "format": "text",
             },
             timeout=REQUEST_TIMEOUT,
         )
@@ -131,7 +148,7 @@ def translate():
 @app.route("/languages", methods=["GET"])
 def languages():
     try:
-        resp = requests.get(f"{LIBRETRANSLATE_URL}/languages", timeout=REQUEST_TIMEOUT)
+        resp = requests.get(f"{NLLB_URL}/languages", timeout=REQUEST_TIMEOUT)
         data = resp.json()
         if not resp.ok:
             return jsonify({"error": "Translation service error"}), 502
