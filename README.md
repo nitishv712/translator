@@ -3,7 +3,7 @@
 A standalone translation API. Fully self-hosted, no external API keys or
 per-request cost — English, Hindi, and Bengali, with automatic language
 detection and a transliteration step for romanized Hindi ("Hinglish", e.g.
-`"toh kaise hai aap"`) that plain Argos Translate can't read on its own.
+`"toh kaise hai aap"`) that a translation model can't read on its own.
 
 Deployed and run independently of any app that uses it (see
 [Deploying](#deploying)) — it doesn't know or care who's calling it.
@@ -11,30 +11,44 @@ Deployed and run independently of any app that uses it (see
 ## Architecture
 
 ```
-                         host machine, port 6010
-                                   │
-                     ┌─────────────▼─────────────┐
-                     │  translate  (Flask, :8200) │  ← the only published port
-                     │  orchestrator               │
-                     └──────┬───────────────┬─────┘
-                             │               │
-                 ┌───────────▼──┐   ┌────────▼─────────┐
-                 │ libretranslate│   │  transliterate    │
-                 │ (Argos        │   │  (IndicXlit,      │
-                 │  Translate)   │   │   romanized→      │
-                 │  :5000        │   │   Devanagari)     │
-                 └───────────────┘   └───────────────────┘
+                       host machine, port 6010
+                                 │
+                 ┌───────────────▼───────────────┐
+                 │  translate  (Flask, :8200)    │ ← the only published port
+                 │  orchestrator                 │
+                 └───┬──────────┬─────────────┬──┘
+                     │          │             │
+           ┌─────────▼┐  ┌──────▼───────┐  ┌──▼─────────────┐
+           │  langid  │  │ transliterate│  │ nllb-translate │
+           │ (GlotLID,│  │ (romanized → │  │ (NLLB-200 600M,│
+           │ fastText)│  │  Devanagari) │  │  CTranslate2)  │
+           │  :8400   │  │    :8100     │  │     :8300      │
+           └──────────┘  └──────────────┘  └────────────────┘
 ```
 
-`libretranslate` and `transliterate` are internal-only — nothing outside
-this compose stack can reach them directly, only `translate` can.
+All three are internal-only — nothing outside this compose stack can reach
+them directly, only `translate` can.
 
-`translate` decides, per request, whether the text needs transliterating
-first: it asks LibreTranslate to detect the language, and if the detector
-isn't confident (below 50%, which is what unrecognized romanized text like
-Hinglish typically produces — it's Latin-script like English, so the
-detector has no "Hinglish" label to fall back on), it runs the text through
-`transliterate` to get proper Devanagari before translating.
+`translate` runs each request through the same three steps:
+
+1. **Identify** — `langid` returns one of the three supported languages and
+   whether the text is romanized Indic. Native script is settled by Unicode
+   range; only Latin-script text reaches the model, since "real English or
+   romanized Hindi?" is the one genuinely ambiguous question here.
+2. **Transliterate** — romanized text goes through `transliterate` first, so
+   the translation model gets Devanagari instead of Latin text it reads as
+   out-of-distribution.
+3. **Translate** — `nllb-translate` does the real work, folding requests that
+   arrive close together into a single model call.
+
+Detection used to be LibreTranslate's `/detect`, which is why that service
+stayed in the stack after Argos Translate stopped doing the translating. It
+reported Hinglish as *confident* English often enough that step 2 got
+skipped, the source came back as English, and a request asking for English
+then found nothing to translate and echoed the caller's own text back at
+them. GlotLID replaced it because it has explicit labels for romanized
+Indic text; `langid/app.py` covers how its output is read and why the
+threshold sits where it does.
 
 ## API
 
@@ -68,7 +82,7 @@ Hinglish fallback both only run when you don't already know the source.
 
 ### `GET /languages`
 
-Proxies LibreTranslate's supported-language list straight through.
+Proxies the translation model's supported-language list straight through.
 
 ### `GET /health`
 
@@ -175,9 +189,11 @@ curl -X POST http://localhost:6010/translate \
   -d '{"text": "toh kaise hai aap", "target": "en"}'
 ```
 
-First boot downloads LibreTranslate's en/hi/bn models and IndicXlit's
-transliteration model — check `docker compose logs -f translate
-libretranslate transliterate` if the first request hangs or errors.
+Model weights are baked into the images at build time — `nllb-translate`
+converts the NLLB checkpoint and `langid` pulls the GlotLID classifier — so
+the first build is slow (several GB fetched) but a started container never
+waits on a download. Check `docker compose logs -f translate langid
+nllb-translate transliterate` if a request hangs or errors.
 
 ## Deploying
 
@@ -186,13 +202,24 @@ bash deploy.sh
 ```
 
 Uses `docker compose` (v2) if installed, falling back to `docker-compose`
-(v1) otherwise. Rebuilds `translate` and `transliterate` (both built from
-source here) and recreates whatever changed; `libretranslate` is an
-unmodified upstream image.
+(v1) otherwise. Every service is built from source in this repo, so a deploy
+rebuilds what changed and recreates it.
 
 ## Environment variables
 
-None required — every URL between the three services here has a working
-default (`LIBRETRANSLATE_URL`, `TRANSLITERATE_URL`), since they always run
-together on the same compose network. Override only if you're running one
-of them somewhere else.
+None required. Every URL between the four services has a working default
+(`LANGID_URL`, `TRANSLITERATE_URL`, `NLLB_URL`), since they always run
+together on the same compose network — override only if you're running one
+somewhere else.
+
+`nllb-translate` also takes the knobs that decide its throughput, all with
+defaults tuned for the 2-CPU budget in `docker-compose.yml`:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `INTER_THREADS` | `2` | Translations running in parallel. Raise with the CPU quota. |
+| `INTRA_THREADS` | `1` | Cores per translation. |
+| `MAX_BATCH_SIZE` | `8` | Requests folded into one model call. |
+| `BATCH_WINDOW_MS` | `15` | How long the first request waits for company. |
+| `MAX_QUEUE_DEPTH` | `128` | Queued requests before new ones are shed with 503. |
+| `JOB_TIMEOUT_SECONDS` | `25` | Wait before a queued request gives up with 504. |

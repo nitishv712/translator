@@ -5,15 +5,15 @@
 # knows talkmos-backend exists; it's just a plain translation API.
 
 # Shared resource limits, merged into every service below via
-# `<<: *resource-limits`. Same budget (1 CPU, 1GB RAM+swap) for all three
-# since none of them are expected to run hot concurrently.
+# `<<: *resource-limits`. Services that need more than this override the
+# individual key (see `langid` and `nllb-translate`); a plain `<<:` merge
+# loses to any key the service sets itself.
 #
-# Deliberately NOT adding cap_drop/read_only/security_opt here: libretranslate
-# runs as root specifically to get write access to its volume (see the
-# comment below), and dropping capabilities strips root's ability to do that
-# even though it's still uid 0 — that's what caused the permission-denied
-# errors. Revisit hardening later with per-service cap_add exceptions if
-# needed, rather than a blanket cap_drop: ALL.
+# There is no cap_drop/read_only/security_opt here. That used to be blocked
+# by libretranslate needing to run as root to write its model volume, and
+# that service is gone now — every remaining container builds from this repo,
+# owns no volume, and could take a blanket cap_drop: ALL. Worth doing as its
+# own change rather than smuggled into this one.
 x-resource-limits: &resource-limits
   cpus: "2.0"
   mem_limit: 2g
@@ -32,42 +32,26 @@ services:
     ports:
       - "6010:8200"
     depends_on:
-      - libretranslate
+      - langid
       - nllb-translate
       - transliterate
     <<: *resource-limits
 
-  # LibreTranslate, kept only for its /detect endpoint now — see
-  # translate-service/app.py for why detection stayed here instead of
-  # moving to a general-purpose library alongside the NLLB swap below.
-  # Argos Translate itself is just a Python library with no server of its
-  # own, so this is the standard way to run it as a service. No ports
-  # published — only `translate` talks to it, at http://libretranslate:5000.
-  libretranslate:
-    image: libretranslate/libretranslate:latest
-    container_name: translator-libretranslate
+  # Language identification (GlotLID), replacing what LibreTranslate was
+  # still here for. Its detector called romanized Hindi confident English,
+  # which skipped transliteration and made the pipeline echo the caller's
+  # own text back — see langid/app.py for the full account. No ports
+  # published — only `translate` talks to it, at http://langid:8400.
+  langid:
+    build:
+      context: ./langid
+    container_name: translator-langid
     restart: unless-stopped
-    # A freshly created named volume is root-owned by default, but the image
-    # drops to a non-root `libretranslate` user before it ever touches
-    # /home/libretranslate/.local/share — it can't create its own model
-    # directory there and crashes before downloading anything. Running the
-    # container as root sidesteps that; it's not reachable from outside this
-    # compose network anyway.
-    user: "0:0"
-    environment:
-      # Loads only the language pairs the app actually offers (English,
-      # Hindi, Bengali) instead of LibreTranslate's full ~30-language
-      # default set, which would mean a much longer first-boot model
-      # download and a lot of unused RAM. Also shapes what /detect can
-      # distinguish between — narrowing it to just these three is part of
-      # why its detection is well-behaved for this app's inputs.
-      - LT_LOAD_ONLY=en,hi,bn
-      - LT_DISABLE_WEB_UI=true
-      - LT_UPDATE_MODELS=false
-    volumes:
-      # Downloaded Argos Translate models persist here — without this every
-      # container recreate (redeploy, `docker-compose up`) re-downloads them.
-      - libretranslate_models:/home/libretranslate/.local/share
+    # Overrides the shared budget: the GlotLID checkpoint is ~1.7GB and
+    # fastText holds all of it resident. Still a net saving here, since the
+    # LibreTranslate container this replaces carried its own Argos models.
+    mem_limit: 3g
+    memswap_limit: 3g
     <<: *resource-limits
 
   # NLLB-200 (distilled 600M) via CTranslate2 — the actual translation
@@ -88,20 +72,16 @@ services:
     memswap_limit: 2g
     <<: *resource-limits
 
-  # Romanized-Hindi ("Hinglish") -> Devanagari, ahead of LibreTranslate.
-  # Argos Translate's Hindi model expects native Devanagari script; fed
-  # "toh kaise hai aap" directly it doesn't reliably understand it as Hindi
-  # at all. `translate` runs a language-detection confidence check first
-  # and only routes text through here when it looks like unrecognized
-  # romanized text, not on every request. No ports published — internal
-  # only, at http://transliterate:8100. Rule-based conversion (see app.py)
-  # — no model weights to fetch or cache, so no volume needed here either.
+  # Romanized-Hindi ("Hinglish") -> Devanagari, ahead of the NLLB model,
+  # which expects native Devanagari script; fed "toh kaise hai aap" directly
+  # it doesn't reliably read it as Hindi at all. `translate` only routes text
+  # here when `langid` reports it as romanized Indic, not on every request.
+  # No ports published — internal only, at http://transliterate:8100.
+  # Rule-based conversion (see app.py) — no model weights to fetch or cache,
+  # so no volume needed here either.
   transliterate:
     build:
       context: ./transliterate
     container_name: translator-transliterate
     restart: unless-stopped
     <<: *resource-limits
-
-volumes:
-  libretranslate_models:

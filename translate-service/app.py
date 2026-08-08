@@ -4,25 +4,21 @@ pipeline actually works. `talkmos-backend` just authenticates the caller and
 forwards the request here; this owns the real logic:
 
   1. Resolve/alias language codes.
-  2. If the source isn't already known, ask LibreTranslate to detect it.
-  3. A low-confidence detection is most often romanized Hindi ("Hinglish")
-     misread as English (LibreTranslate has no "Hinglish" label of its own,
-     and Hinglish is Latin-script like English) — run it through the
-     transliterate service first so the translation model gets the native
-     Devanagari script it was actually trained on.
+  2. If the source isn't already known, ask the langid service to identify
+     it. It answers with one of the app's three languages plus whether the
+     text is romanized Indic ("Hinglish", e.g. "toh kaise hai aap").
+  3. Romanized text goes through the transliterate service first, so the
+     translation model gets the native Devanagari script it was actually
+     trained on rather than Latin text it reads as out-of-distribution.
   4. Call the NLLB translation service for the real translation.
 
-LibreTranslate itself is only used for step 2 (its /detect endpoint) now —
-translation (step 4) moved to a dedicated NLLB service because Argos
-Translate's own translations were noticeably less fluent for this app's
-pairs (e.g. "How is you" instead of "How are you"). Detection stayed on
-LibreTranslate rather than moving to a general-purpose library like
-langdetect: LibreTranslate's detector is already tuned well for exactly
-this app's ambiguity (short, informal Latin-script text that's either real
-English or romanized Hindi) — testing langdetect on the same kind of input
-("mujhe pyaar hai", "good morning") returned confident-but-wrong guesses
-(Swahili, Croatian), which would have broken the fallback below rather
-than just being a lateral swap.
+Both of those first two steps used to be LibreTranslate's job, and neither
+is any more. Translation (step 4) moved to a dedicated NLLB service because
+Argos Translate's fluency was noticeably worse for this app's pairs (e.g.
+"How is you" instead of "How are you"). Detection (step 2) then moved to
+the langid service, because LibreTranslate's detector reported Hinglish as
+confident English often enough to break step 3 — see that service's
+docstring for what that did to the response.
 
 Kept as its own service — not a module inside the main backend — so the
 translation pipeline can be understood, deployed, and scaled on its own,
@@ -35,24 +31,17 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-LIBRETRANSLATE_URL = os.environ.get("LIBRETRANSLATE_URL", "http://libretranslate:5000")
+LANGID_URL = os.environ.get("LANGID_URL", "http://langid:8400")
 NLLB_URL = os.environ.get("NLLB_URL", "http://nllb-translate:8300")
 TRANSLITERATE_URL = os.environ.get("TRANSLITERATE_URL", "http://transliterate:8100")
 
 # "hinglish" isn't a real language the translation model has directly — an
 # explicit "hinglish" source is aliased to Hindi. In practice callers send
-# "auto" and let detection + the confidence fallback below decide; this
-# only matters for a caller that names it explicitly.
+# "auto" and let langid decide; this only matters for a caller that names it
+# explicitly.
 LANGUAGE_ALIASES = {
     "hinglish": "hi",
 }
-
-# Below this, a detection is treated as too unreliable to trust — most often
-# because the text is romanized Hindi, which reads as low-confidence English
-# (or something else entirely) to LibreTranslate's detector. There's no
-# principled "correct" threshold here, just a practical cutoff; 100 is the
-# maximum LibreTranslate reports.
-HINGLISH_FALLBACK_CONFIDENCE = 50
 
 REQUEST_TIMEOUT = 30
 
@@ -63,13 +52,12 @@ def resolve_language_code(code):
 
 def detect_language(text):
     resp = requests.post(
-        f"{LIBRETRANSLATE_URL}/detect", json={"q": text}, timeout=REQUEST_TIMEOUT
+        f"{LANGID_URL}/detect", json={"text": text}, timeout=REQUEST_TIMEOUT
     )
     data = resp.json()
-    if not resp.ok or not isinstance(data, list) or len(data) == 0:
-        message = data.get("error") if isinstance(data, dict) else None
-        raise RuntimeError(message or "Language detection failed")
-    return data[0]  # sorted by confidence, highest first
+    if not resp.ok or not data.get("language"):
+        raise RuntimeError(data.get("error") or "Language detection failed")
+    return data
 
 
 def transliterate_to_hindi(text):
@@ -107,16 +95,14 @@ def translate():
             source_code = resolve_language_code(source)
             if source in LANGUAGE_ALIASES:
                 # Explicit "hinglish" hits the same out-of-distribution
-                # problem as the low-confidence auto-detect path below —
-                # Argos's Hindi model needs Devanagari, not romanized text.
+                # problem the detector catches below — the translation model
+                # needs Devanagari, not romanized text.
                 working_text = transliterate_to_hindi(text)
         else:
             detected = detect_language(text)
-            if detected["confidence"] < HINGLISH_FALLBACK_CONFIDENCE:
+            source_code = detected["language"]
+            if detected["romanized"]:
                 working_text = transliterate_to_hindi(text)
-                source_code = "hi"
-            else:
-                source_code = detected["language"]
 
         if source_code == target_code:
             # Nothing left to translate — either already in the target

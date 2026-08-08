@@ -1,10 +1,10 @@
 """
 Romanized Hindi ("Hinglish") -> Devanagari transliteration.
 
-Argos Translate's Hindi model (like Google ML Kit's before it) was trained
-on native Devanagari text — fed "toh kaise hai aap" directly, it doesn't
-reliably recognize that as Hindi at all, since that's out-of-distribution
-input for it. This service is the missing step: convert romanized text to
+NLLB's Hindi (like Argos Translate's and Google ML Kit's before it) was
+trained on native Devanagari text — fed "toh kaise hai aap" directly, it
+doesn't reliably recognize that as Hindi at all, since that's
+out-of-distribution input for it. This service is the missing step: convert romanized text to
 proper Devanagari first, so the translation model downstream gets input it
 actually understands.
 

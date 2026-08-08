@@ -42,4 +42,8 @@ COPY app.py .
 
 EXPOSE 8300
 
-CMD ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:8300", "--timeout", "60", "app:app"]
+# Still one worker — a second would load its own copy of the model, and the
+# batcher thread inside this one is what actually feeds CTranslate2. The
+# threads only need to be numerous enough to hold the queue's worth of
+# callers while they wait on it; they spend that time blocked, not running.
+CMD ["gunicorn", "-w", "1", "--threads", "128", "-b", "0.0.0.0:8300", "--timeout", "60", "app:app"]

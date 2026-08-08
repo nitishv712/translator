@@ -1,0 +1,7 @@
+flask
+gunicorn
+# Predict-only fastText bindings: ships manylinux wheels (no compiler in the
+# image) and drops the numpy dependency the full `fasttext` package carries,
+# whose 0.9.3 release is broken against numpy 2.x — its predict() still calls
+# np.array(..., copy=False), which numpy 2 turns into a hard error.
+fasttext-predict
